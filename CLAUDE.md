@@ -25,6 +25,9 @@ cmake --build build
 cmake -DENABLE_TESTING=ON -B build
 cmake --build build
 ctest --test-dir build
+
+# Run a single test
+ctest --test-dir build -R <test_name>
 ```
 
 ## Development Environment
@@ -39,3 +42,7 @@ ctest --test-dir build
 
 - Compiler: GCC
 - Flags: `-Wall -Wfatal-errors -Wextra -Werror -g -O1`
+
+## Architecture
+
+DNS server using UDP sockets on port 2053. Entry point is `src/main.cpp` which sets up a UDP socket, binds to the port, and runs an event loop receiving DNS queries and sending responses.
