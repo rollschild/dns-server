@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <string>
+#include <vector>
 
 /*
 DNS Header Structure (12 bytes):
@@ -64,6 +66,8 @@ struct DNSHeader {
         uint16_t opcode = (query.flags >> 11) & 0x0F;
         uint16_t rd = (query.flags >> 8) & 0x01;
 
+        uint16_t rcode = opcode == 0 ? 0 : 4;
+
         // build response flags
         // QR=1 (response)
         // OPCODE copied
@@ -73,7 +77,7 @@ struct DNSHeader {
         // RA=0
         // Z=0
         // RCODE=0
-        response.flags = (1 << 15) | (opcode << 11) | (rd << 8);
+        response.flags = (1 << 15) | (opcode << 11) | (rd << 8) | rcode;
 
         response.qdcount = query.qdcount;
         response.ancount = 0;
@@ -81,6 +85,142 @@ struct DNSHeader {
         response.arcount = 0;
 
         return response;
+    }
+};
+
+struct DNSQuestion {
+    std::string qname;  // domain name (e.g., "google.com")
+    uint16_t qtype;     // query type (1 = A record)
+    uint16_t qclass;    // query class (1 = INTERNET)
+
+    // return number of bytes consumed from buffer
+    size_t parse_from(const char* buffer) {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer);
+        size_t offset = 0;
+
+        // parse QNAME
+        while (data[offset] != 0) {
+            uint8_t label_len = data[offset];
+            ++offset;
+            if (!qname.empty()) {
+                qname += '.';
+            }
+            qname.append(reinterpret_cast<const char*>(data + offset),
+                         label_len);
+            offset += label_len;
+        }
+        ++offset;  // skip null terminator
+
+        // parse QTYPE and QCLASS (big-endian)
+        qtype = (data[offset] << 8) | data[offset + 1];
+        offset += 2;
+        qclass = (data[offset] << 8) | data[offset + 1];
+        offset += 2;
+
+        return offset;
+    }
+
+    // return number of bytes written
+    size_t write_to(char* buffer) const {
+        uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
+        size_t offset = 0;
+
+        // write QANME as labels
+        size_t pos = 0;
+        while (pos < qname.size()) {
+            size_t dot_pos = qname.find('.', pos);
+            if (dot_pos == std::string::npos) {
+                dot_pos = qname.size();  // end of qname?
+            }
+            uint8_t label_len = dot_pos - pos;
+            data[offset++] = label_len;
+            for (size_t i = pos; i < dot_pos; ++i) {
+                data[offset++] = qname[i];
+            }
+            pos = dot_pos + 1;
+        }
+        data[offset++] = 0;  // null terminator
+
+        // write QTYPE and QCLASS
+        data[offset++] = (qtype >> 8) & 0xFF;
+        data[offset++] = qtype & 0xFF;
+        data[offset++] = (qclass >> 8) & 0xFF;
+        data[offset++] = qclass & 0xFF;
+
+        return offset;
+    }
+};
+
+struct DNSAnswer {
+    std::string name;            // domain name
+    uint16_t type;               // record type (1 = A)
+    uint16_t cl;                 // class (1 = IN)
+    uint32_t ttl;                // time to live
+    uint16_t rdlen;              // length of rdata
+    std::vector<uint8_t> rdata;  // record data (IPv4 for A record)
+
+    // return number of bytes written
+    size_t write_to(char* buffer, bool use_compression = false) const {
+        uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
+        size_t offset = 0;
+
+        if (use_compression) {
+            data[offset++] = 0xC0;
+            data[offset++] = 0x0C;
+        } else {
+            // write full domain name as labels
+            size_t pos = 0;
+            while (pos < name.size()) {
+                size_t dot_pos = name.find('.', pos);
+                if (dot_pos == std::string::npos) {
+                    dot_pos = name.size();
+                }
+                uint8_t label_len = dot_pos - pos;
+                data[offset++] = label_len;
+                for (size_t i = pos; i < dot_pos; ++i) {
+                    data[offset++] = name[i];
+                }
+                pos = dot_pos + 1;
+            }
+            data[offset++] = 0;  // null terminator
+        }
+
+        // TYPE
+        data[offset++] = (type >> 8) & 0xFF;
+        data[offset++] = type & 0xFF;
+        // CLASS
+        data[offset++] = (cl >> 8) & 0xFF;
+        data[offset++] = cl & 0xFF;
+
+        // TTL (big-endian, 4 bytes)
+        data[offset++] = (ttl >> 24) & 0xFF;
+        data[offset++] = (ttl >> 16) & 0xFF;
+        data[offset++] = (ttl >> 8) & 0xFF;
+        data[offset++] = ttl & 0xFF;
+
+        // RDLENGTH
+        data[offset++] = (rdlen >> 8) & 0xFF;
+        data[offset++] = rdlen & 0xFF;
+
+        // RDATA
+        for (auto byte : rdata) {
+            data[offset++] = byte;
+        }
+
+        return offset;
+    }
+
+    static DNSAnswer create_a_record(const std::string& domain, uint32_t ttl,
+                                     uint8_t a, uint8_t b, uint8_t c,
+                                     uint8_t d) {
+        DNSAnswer ans;
+        ans.name = domain;
+        ans.type = 1;  // A record
+        ans.cl = 1;
+        ans.ttl = ttl;
+        ans.rdlen = 4;
+        ans.rdata = {a, b, c, d};
+        return ans;
     }
 };
 
@@ -151,9 +291,25 @@ int main() {
         DNSHeader query_header{};
         query_header.parse_from(buffer);
 
+        DNSQuestion question{};
+        question.parse_from(buffer + 12);  // after 12-byte header
+
         DNSHeader response_header = DNSHeader::create_response(query_header);
 
         char response[512] = {};
+        response_header.write_to(response);
+        size_t response_len = 12;
+
+        // echo back the question section
+        response_len += question.write_to(response + response_len);
+
+        DNSAnswer ans =
+            DNSAnswer::create_a_record(question.qname, 60, 8, 8, 8, 8);
+        response_len += ans.write_to(response + response_len);
+
+        // update header to reflect 1 answer
+        response_header.ancount = 1;
+        // re-write header with updated ancount (account number)
         response_header.write_to(response);
 
         // Send response

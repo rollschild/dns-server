@@ -11,6 +11,7 @@ Each message consists of 5 sections:
   - big endian
 - question
 - answer
+  - contains **Resource Records**
 - authority
 - an additional space
 

@@ -28,6 +28,9 @@ ctest --test-dir build
 
 # Run a single test
 ctest --test-dir build -R <test_name>
+
+# Test DNS server manually (while server is running)
+dig @127.0.0.1 -p 2053 example.com
 ```
 
 ## Development Environment
@@ -46,3 +49,7 @@ ctest --test-dir build -R <test_name>
 ## Architecture
 
 DNS server using UDP sockets on port 2053. Entry point is `src/main.cpp` which sets up a UDP socket, binds to the port, and runs an event loop receiving DNS queries and sending responses.
+
+### DNS Message Format
+
+All DNS communications use a single message format with 5 sections: header (12 bytes, big-endian), question, answer, authority, and additional. The `DNSHeader` struct in `src/main.cpp` handles header parsing and serialization.
