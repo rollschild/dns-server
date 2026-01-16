@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 /*
@@ -88,28 +90,110 @@ struct DNSHeader {
     }
 };
 
+class DNSCompressionTable {
+   private:
+    std::map<std::string, size_t> offsets;
+
+   public:
+    /**
+     * Record a name and all its suffixes at the given offset
+     * e.g. "www.google.com" at offset 12 records:
+     *   - "www.google.com" -> 12
+     *   - "google.com" -> 16
+     *   - "com" -> 24
+     */
+    void record_name(const std::string& name, size_t offset) {
+        std::string suffix = name;
+        size_t pos = 0;
+        while (!suffix.empty()) {
+            if (offsets.find(suffix) == offsets.end()) {
+                offsets[suffix] = offset + pos;
+            }
+            size_t dot = suffix.find('.');
+            if (dot == std::string::npos) {
+                break;
+            }
+            pos += dot + 2;  // +1 for label length byte; +1 to skip dot
+            suffix = suffix.substr(dot + 1);
+        }
+    }
+
+    std::pair<size_t, size_t> find_pointer(const std::string& name) const {
+        std::string suffix = name;
+        size_t name_pos = 0;
+        while (!suffix.empty()) {
+            auto it = offsets.find(suffix);
+            if (it != offsets.end() && it->second < 0x3FFF) {
+                // 14-bit max
+                return {name_pos, it->second};
+            }
+            size_t dot = suffix.find('.');
+            if (dot == std::string::npos) break;
+            name_pos = name_pos + dot + 1;
+            suffix = suffix.substr(dot + 1);
+        }
+
+        return {std::string::npos, 0};
+    }
+};
+
+/**
+ * Helper function to parse a domain name, handling compression pointers
+ * Returns: {parsed_name, bytes_consumed_at_current_position}
+ */
+std::pair<std::string, size_t> parse_domain_name(const char* msg_start,
+                                                 const char* current_pos) {
+    const uint8_t* msg = reinterpret_cast<const uint8_t*>(msg_start);
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(current_pos);
+    std::string name;
+    size_t offset = 0;
+    size_t bytes_consumed = 0;
+    bool jumped = false;  // TODO: what is this?
+
+    while (true) {
+        uint8_t len = data[offset];
+        if (len == 0) {
+            // end of name
+            if (!jumped) {
+                bytes_consumed = offset + 1;
+            }
+            break;
+        }
+
+        if ((len & 0xC0) == 0xC0) {
+            // compression pointer: 2 bytes, upper 2 bits are `11`
+            if (!jumped) {
+                bytes_consumed = offset + 2;  // only count first pointer
+            }
+            uint16_t ptr = ((len & 0x2F) << 8) | data[offset + 1];
+            data = msg + ptr;  // jump to pointed location
+            offset = 0;        // TODO: why?
+            jumped = true;
+            continue;
+        }
+
+        // regular label
+        if (!name.empty()) {
+            name += '.';
+        }
+        name.append(reinterpret_cast<const char*>(data + offset + 1), len);
+        offset += len + 1;
+    }
+
+    return {name, bytes_consumed};
+}
+
 struct DNSQuestion {
     std::string qname;  // domain name (e.g., "google.com")
     uint16_t qtype;     // query type (1 = A record)
     uint16_t qclass;    // query class (1 = INTERNET)
 
     // return number of bytes consumed from buffer
-    size_t parse_from(const char* buffer) {
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer);
-        size_t offset = 0;
-
-        // parse QNAME
-        while (data[offset] != 0) {
-            uint8_t label_len = data[offset];
-            ++offset;
-            if (!qname.empty()) {
-                qname += '.';
-            }
-            qname.append(reinterpret_cast<const char*>(data + offset),
-                         label_len);
-            offset += label_len;
-        }
-        ++offset;  // skip null terminator
+    size_t parse_from(const char* msg_start, const char* current_pos) {
+        auto [name, name_bytes] = parse_domain_name(msg_start, current_pos);
+        qname = name;
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(current_pos);
+        size_t offset = name_bytes;
 
         // parse QTYPE and QCLASS (big-endian)
         qtype = (data[offset] << 8) | data[offset + 1];
@@ -121,6 +205,47 @@ struct DNSQuestion {
     }
 
     // return number of bytes written
+    size_t write_compressed_to(char* buffer, size_t msg_offset,
+                               DNSCompressionTable& table) const {
+        uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
+        size_t offset = 0;
+
+        auto [suffix_pos, ptr_offset] = table.find_pointer(qname);
+
+        if (suffix_pos == 0) {
+            // entire name can be compressed
+            data[offset++] = 0xC0 | ((ptr_offset >> 8) & 0x3F);
+            data[offset++] = ptr_offset & 0xFF;
+        } else {
+            // record this name's position
+            table.record_name(qname, msg_offset);
+
+            // write QANME as labels
+            size_t pos = 0;
+            while (pos < qname.size()) {
+                size_t dot_pos = qname.find('.', pos);
+                if (dot_pos == std::string::npos) {
+                    dot_pos = qname.size();  // end of qname?
+                }
+                uint8_t label_len = dot_pos - pos;
+                data[offset++] = label_len;
+                for (size_t i = pos; i < dot_pos; ++i) {
+                    data[offset++] = qname[i];
+                }
+                pos = dot_pos + 1;
+            }
+            data[offset++] = 0;  // null terminator
+        }
+
+        // write QTYPE and QCLASS
+        data[offset++] = (qtype >> 8) & 0xFF;
+        data[offset++] = qtype & 0xFF;
+        data[offset++] = (qclass >> 8) & 0xFF;
+        data[offset++] = qclass & 0xFF;
+
+        return offset;
+    }
+
     size_t write_to(char* buffer) const {
         uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
         size_t offset = 0;
@@ -159,15 +284,67 @@ struct DNSAnswer {
     uint16_t rdlen;              // length of rdata
     std::vector<uint8_t> rdata;  // record data (IPv4 for A record)
 
-    // return number of bytes written
-    size_t write_to(char* buffer, bool use_compression = false) const {
+    size_t write_to(char* buffer) const {
         uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
         size_t offset = 0;
 
-        if (use_compression) {
-            data[offset++] = 0xC0;
-            data[offset++] = 0x0C;
+        // write full domain name as labels
+        size_t pos = 0;
+        while (pos < name.size()) {
+            size_t dot_pos = name.find('.', pos);
+            if (dot_pos == std::string::npos) {
+                dot_pos = name.size();
+            }
+            uint8_t label_len = dot_pos - pos;
+            data[offset++] = label_len;
+            for (size_t i = pos; i < dot_pos; ++i) {
+                data[offset++] = name[i];
+            }
+            pos = dot_pos + 1;
+        }
+        data[offset++] = 0;  // null terminator
+
+        // TYPE
+        data[offset++] = (type >> 8) & 0xFF;
+        data[offset++] = type & 0xFF;
+        // CLASS
+        data[offset++] = (cl >> 8) & 0xFF;
+        data[offset++] = cl & 0xFF;
+
+        // TTL (big-endian, 4 bytes)
+        data[offset++] = (ttl >> 24) & 0xFF;
+        data[offset++] = (ttl >> 16) & 0xFF;
+        data[offset++] = (ttl >> 8) & 0xFF;
+        data[offset++] = ttl & 0xFF;
+
+        // RDLENGTH
+        data[offset++] = (rdlen >> 8) & 0xFF;
+        data[offset++] = rdlen & 0xFF;
+
+        // RDATA
+        for (auto byte : rdata) {
+            data[offset++] = byte;
+        }
+
+        return offset;
+    }
+
+    // return number of bytes written
+    size_t write_compressed_to(char* buffer, size_t msg_offset,
+                               DNSCompressionTable& table) const {
+        uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
+        size_t offset = 0;
+
+        auto [suffix_pos, ptr_offset] = table.find_pointer(name);
+
+        if (suffix_pos == 0) {
+            // entire name can be compressed
+            data[offset++] = 0xC0 | ((ptr_offset >> 8) & 0x3F);
+            data[offset++] = ptr_offset & 0xFF;
         } else {
+            // record this name's position
+            table.record_name(name, msg_offset);
+
             // write full domain name as labels
             size_t pos = 0;
             while (pos < name.size()) {
@@ -273,6 +450,8 @@ int main() {
     char buffer[512];
     socklen_t clientAddrLen = sizeof(clientAddress);
 
+    DNSCompressionTable compression;
+
     while (true) {
         // Receive data
         // recvfrom and sendto are specifically for UDP
@@ -291,8 +470,14 @@ int main() {
         DNSHeader query_header{};
         query_header.parse_from(buffer);
 
-        DNSQuestion question{};
-        question.parse_from(buffer + 12);  // after 12-byte header
+        std::vector<DNSQuestion> questions;
+        const char* question_ptr = buffer + 12;  // after 12-byte header
+        for (uint16_t i = 0; i < query_header.qdcount; ++i) {
+            DNSQuestion q;
+            size_t consumed = q.parse_from(buffer, question_ptr);
+            questions.push_back(q);
+            question_ptr += consumed;
+        }
 
         DNSHeader response_header = DNSHeader::create_response(query_header);
 
@@ -301,14 +486,27 @@ int main() {
         size_t response_len = 12;
 
         // echo back the question section
-        response_len += question.write_to(response + response_len);
+        // record the name at offset 12
+        // response_len += question.write_to(response + response_len,
+        // response_len, compression);
+        // uncompressed write back
+        for (const auto& q : questions) {
+            response_len += q.write_to(response + response_len);
+        }
 
-        DNSAnswer ans =
-            DNSAnswer::create_a_record(question.qname, 60, 8, 8, 8, 8);
-        response_len += ans.write_to(response + response_len);
+        // write answers uncompressed (one per question)
+        std::vector<DNSAnswer> answers;
+        for (const auto& q : questions) {
+            DNSAnswer ans = DNSAnswer::create_a_record(q.qname, 60, 8, 8, 8, 8);
+            // use compression pointer to question's name
+            // response_len +=
+            // ans.write_to(response + response_len, response_len, compression);
+            response_len += ans.write_to(response + response_len);
+            answers.push_back(ans);
+        }
 
         // update header to reflect 1 answer
-        response_header.ancount = 1;
+        response_header.ancount = answers.size();
         // re-write header with updated ancount (account number)
         response_header.write_to(response);
 

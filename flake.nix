@@ -48,6 +48,8 @@
               starship
 
               pkg-config
+
+              dig
             ];
 
             buildInputs = with pkgs; [

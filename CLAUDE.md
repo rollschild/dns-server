@@ -50,6 +50,14 @@ dig @127.0.0.1 -p 2053 example.com
 
 DNS server using UDP sockets on port 2053. Entry point is `src/main.cpp` which sets up a UDP socket, binds to the port, and runs an event loop receiving DNS queries and sending responses.
 
+### DNS Message Structs
+
+All defined in `src/main.cpp`:
+
+- **DNSHeader**: 12-byte header with ID, flags, and section counts. Methods: `parse_from()`, `write_to()`, `create_response()`
+- **DNSQuestion**: Query section with domain name (QNAME), type (QTYPE), and class (QCLASS). Handles label encoding (length-prefixed segments)
+- **DNSAnswer**: Resource record with domain, type, class, TTL, and RDATA. Supports DNS compression (0xC00C pointer). Static factory: `create_a_record()`
+
 ### DNS Message Format
 
-All DNS communications use a single message format with 5 sections: header (12 bytes, big-endian), question, answer, authority, and additional. The `DNSHeader` struct in `src/main.cpp` handles header parsing and serialization.
+All DNS communications use a single message format with 5 sections: header (12 bytes, big-endian), question, answer, authority, and additional.
