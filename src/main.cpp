@@ -487,7 +487,7 @@ int main() {
 
         // echo back the question section
         // record the name at offset 12
-        // response_len += question.write_to(response + response_len,
+        // response_len += question.write_compressed_to(response + response_len,
         // response_len, compression);
         // uncompressed write back
         for (const auto& q : questions) {
@@ -500,7 +500,8 @@ int main() {
             DNSAnswer ans = DNSAnswer::create_a_record(q.qname, 60, 8, 8, 8, 8);
             // use compression pointer to question's name
             // response_len +=
-            // ans.write_to(response + response_len, response_len, compression);
+            // ans.write_compressed_to(response + response_len, response_len,
+            // compression);
             response_len += ans.write_to(response + response_len);
             answers.push_back(ans);
         }
