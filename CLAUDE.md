@@ -50,6 +50,10 @@ dig @127.0.0.1 -p 2053 example.com
 
 DNS server using UDP sockets on port 2053. Entry point is `src/main.cpp` which sets up a UDP socket, binds to the port, and runs an event loop receiving DNS queries and sending responses.
 
+Socket configuration: SO_REUSEPORT enabled, 512-byte buffer (standard DNS max).
+
+**Current behavior**: Returns hardcoded IP 8.8.8.8 for all A record queries.
+
 ### DNS Message Structs
 
 All defined in `src/main.cpp`:
@@ -57,6 +61,7 @@ All defined in `src/main.cpp`:
 - **DNSHeader**: 12-byte header with ID, flags, and section counts. Methods: `parse_from()`, `write_to()`, `create_response()`
 - **DNSQuestion**: Query section with domain name (QNAME), type (QTYPE), and class (QCLASS). Handles label encoding (length-prefixed segments)
 - **DNSAnswer**: Resource record with domain, type, class, TTL, and RDATA. Supports DNS compression (0xC00C pointer). Static factory: `create_a_record()`
+- **DNSCompressionTable**: Maps domain names to message offsets for pointer-based compression (RFC 1035 Section 4.1.4). Methods: `record_name()`, `find_pointer()`
 
 ### DNS Message Format
 

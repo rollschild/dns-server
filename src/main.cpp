@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -139,6 +140,9 @@ class DNSCompressionTable {
 
 /**
  * Helper function to parse a domain name, handling compression pointers
+ * Parameters:
+ *   - `msg_start`: pointer to beginning of the entire DNS message
+ *   - `current_pos`: pointer to where the domain name starts in the buffer
  * Returns: {parsed_name, bytes_consumed_at_current_position}
  */
 std::pair<std::string, size_t> parse_domain_name(const char* msg_start,
@@ -148,9 +152,11 @@ std::pair<std::string, size_t> parse_domain_name(const char* msg_start,
     std::string name;
     size_t offset = 0;
     size_t bytes_consumed = 0;
-    bool jumped = false;  // TODO: what is this?
+    bool jumped = false;  // whether we've followed a compression pointer
 
     while (true) {
+        // first byte is length of the domain name, e.g. for example.com
+        // [7]example[3]com[0]
         uint8_t len = data[offset];
         if (len == 0) {
             // end of name
@@ -160,14 +166,19 @@ std::pair<std::string, size_t> parse_domain_name(const char* msg_start,
             break;
         }
 
+        // detects if the top 2 bits are `11`
         if ((len & 0xC0) == 0xC0) {
             // compression pointer: 2 bytes, upper 2 bits are `11`
             if (!jumped) {
                 bytes_consumed = offset + 2;  // only count first pointer
             }
-            uint16_t ptr = ((len & 0x2F) << 8) | data[offset + 1];
+
+            // extract the 14-bit offset
+            uint16_t ptr = ((len & 0x3F) << 8) | data[offset + 1];
             data = msg + ptr;  // jump to pointed location
-            offset = 0;        // TODO: why?
+            offset = 0;        // reset offset to zero since we've jumped
+            // if jumped, we are reading from elsewhere in the message,
+            // so we stop updating `bytes_consumed`
             jumped = true;
             continue;
         }
@@ -399,9 +410,85 @@ struct DNSAnswer {
         ans.rdata = {a, b, c, d};
         return ans;
     }
+
+    size_t parse_from(const char* msg_start, const char* current_pos) {
+        auto [parsed_name, name_bytes] =
+            parse_domain_name(msg_start, current_pos);
+        name = parsed_name;
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(current_pos);
+        size_t offset = name_bytes;
+
+        type = (data[offset] << 8) | data[offset + 1];
+        offset += 2;
+        cl = (data[offset] << 8) | data[offset + 1];
+        offset += 2;
+        ttl = (data[offset] << 24) | (data[offset + 1] << 16) |
+              (data[offset + 2] << 8) | data[offset + 3];
+        offset += 4;
+        rdlen = (data[offset] << 8) | data[offset + 1];
+        offset += 2;
+
+        rdata.clear();
+        for (uint16_t i = 0; i < rdlen; ++i) {
+            rdata.push_back(data[offset + i]);
+        }
+        offset += rdlen;
+
+        return offset;
+    }
 };
 
-int main() {
+ssize_t forward_dns_query(const char* query_buf, size_t query_len,
+                          char* response_buf, size_t respone_buf_size,
+                          const std::string& resovler_ip,
+                          uint16_t resolver_port) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == -1) return -1;
+
+    struct sockaddr_in resolver_addr{};
+    resolver_addr.sin_family = AF_INET;
+    resolver_addr.sin_port = htons(resolver_port);
+    // inet_pton: converts human-readable IP address into compact binary
+    // network format
+    inet_pton(AF_INET, resovler_ip.c_str(), &resolver_addr.sin_addr);
+
+    sendto(sock, query_buf, query_len, 0,
+           reinterpret_cast<struct sockaddr*>(&resolver_addr),
+           sizeof(resolver_addr));
+
+    socklen_t addr_len = sizeof(resolver_addr);
+    ssize_t received =
+        recvfrom(sock, response_buf, respone_buf_size, 0,
+                 reinterpret_cast<struct sockaddr*>(&resolver_addr), &addr_len);
+
+    close(sock);
+    return received;
+}
+
+/**
+ * Build single-question DNS query packet
+ * Returns: length of the query packet
+ */
+size_t build_single_question_query(char* buffer, uint16_t id,
+                                   const DNSQuestion& question,
+                                   uint16_t original_flags) {
+    DNSHeader header{};
+    header.id = id;
+    // keep original flags but ensure QR=0 (query)
+    header.flags = original_flags & 0x7FFF;
+    header.qdcount = 1;
+    header.ancount = 0;
+    header.nscount = 0;
+    header.arcount = 0;
+
+    header.write_to(buffer);
+    size_t offset = 12;
+    offset += question.write_to(buffer + offset);
+
+    return offset;
+}
+
+int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
@@ -412,6 +499,32 @@ int main() {
     // You can use print statements as follows for debugging, they'll be visible
     // when running tests.
     std::cout << "Logs from your program will appear here!" << std::endl;
+
+    // parse command line argus for `--resolver`
+    std::string resolver_ip{};
+    uint16_t resolver_port = 0;
+    bool use_forwarding = false;
+
+    for (int i = 0; i < argc; ++i) {
+        if (std::string(argv[i]) == "--resolver" && i + 1 < argc) {
+            std::string resolver_arg = argv[i + 1];
+            size_t colon_pos = resolver_arg.find(':');
+            if (colon_pos != std::string::npos) {
+                resolver_ip = resolver_arg.substr(0, colon_pos);
+                resolver_port = std::stoi(resolver_arg.substr(colon_pos + 1));
+                use_forwarding = true;
+            }
+            break;
+        }
+    }
+
+    if (use_forwarding) {
+        std::cout << "DNS forwarder starting, resolver: " << resolver_ip << ":"
+                  << resolver_port << std::endl;
+    } else {
+        std::cout << "DNS Server starting (standalone mode, returning 8.8.8.8)"
+                  << std::endl;
+    }
 
     int udpSocket;
     struct sockaddr_in clientAddress;
@@ -479,7 +592,59 @@ int main() {
             question_ptr += consumed;
         }
 
+        // collect all answers from resolver(s)
+        std::vector<DNSAnswer> all_answers;
+
+        if (use_forwarding) {
+            // forwarding mode: forward each question to resolver
+            for (size_t i = 0; i < questions.size(); ++i) {
+                char forward_query[512] = {};
+                size_t forward_query_len = build_single_question_query(
+                    forward_query, query_header.id, questions[i],
+                    query_header.flags);
+                char resolver_response[512] = {};
+                // single-question query forwarded to resolver
+                ssize_t resolver_bytes = forward_dns_query(
+                    forward_query, forward_query_len, resolver_response,
+                    sizeof(resolver_response), resolver_ip, resolver_port);
+
+                if (resolver_bytes > 0) {
+                    // parse the resolver response
+                    DNSHeader resolver_header{};
+                    resolver_header.parse_from(resolver_response);
+
+                    // skip past header and question section in resolver
+                    // response
+                    const char* answer_ptr = resolver_response + 12;
+                    for (uint16_t j = 0; j < resolver_header.qdcount; ++j) {
+                        DNSQuestion q;
+                        size_t consumed =
+                            q.parse_from(resolver_response, answer_ptr);
+                        answer_ptr += consumed;
+                    }
+
+                    // parse all answers
+                    for (uint16_t k = 0; k < resolver_header.ancount; ++k) {
+                        DNSAnswer ans;
+                        size_t consumed =
+                            ans.parse_from(resolver_response, answer_ptr);
+                        all_answers.push_back(ans);
+                        answer_ptr += consumed;
+                    }
+                }
+            }
+
+        } else {
+            // standalone mode
+            for (const auto& q : questions) {
+                DNSAnswer ans =
+                    DNSAnswer::create_a_record(q.qname, 60, 8, 8, 8, 8);
+                all_answers.push_back(ans);
+            }
+        }
+
         DNSHeader response_header = DNSHeader::create_response(query_header);
+        response_header.ancount = all_answers.size();
 
         char response[512] = {};
         response_header.write_to(response);
@@ -495,21 +660,9 @@ int main() {
         }
 
         // write answers uncompressed (one per question)
-        std::vector<DNSAnswer> answers;
-        for (const auto& q : questions) {
-            DNSAnswer ans = DNSAnswer::create_a_record(q.qname, 60, 8, 8, 8, 8);
-            // use compression pointer to question's name
-            // response_len +=
-            // ans.write_compressed_to(response + response_len, response_len,
-            // compression);
+        for (const auto& ans : all_answers) {
             response_len += ans.write_to(response + response_len);
-            answers.push_back(ans);
         }
-
-        // update header to reflect 1 answer
-        response_header.ancount = answers.size();
-        // re-write header with updated ancount (account number)
-        response_header.write_to(response);
 
         // Send response
         if (sendto(udpSocket, response, sizeof(response), 0,
